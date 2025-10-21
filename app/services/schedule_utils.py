@@ -1,17 +1,10 @@
 # app/services/schedule_utils.py
 # ------------------------------------------------------------
-# Утилиты для работы с маской дней недели (пн..вс) в виде битов.
-# Битовое представление (LSB -> Monday):
-#   0: Mon, 1: Tue, 2: Wed, 3: Thu, 4: Fri, 5: Sat, 6: Sun
-# Примеры:
-#   127 (0b1111111) — все дни,
-#   31  (0b011111)  — будни (Mon..Fri),
-#   96  (0b1100000) — выходные (Sat..Sun).
+# Утилиты для работы с маской дней недели и временем.
 # ------------------------------------------------------------
 
 from __future__ import annotations
-
-from typing import Optional
+from typing import Optional, Tuple
 
 # Метки для человека и для CRON
 _DOW_HUMAN = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -43,16 +36,12 @@ def toggle_day(mask: int, idx: int) -> int:
 def mask_to_cron(mask: Optional[int]) -> Optional[str]:
     """
     Переводит битовую маску дней в строку для APScheduler/CronTrigger(day_of_week=...).
-    Возвращает:
-      - "mon,tue,..." если выбраны конкретные дни;
-      - None — если mask None или эквивалентна "все дни".
     """
     if mask is None:
         return None
 
     mask = int(mask) & 0b1111111
     if mask == 0 or mask == all_days_mask():
-        # 'None' для CronTrigger означает «каждый день»
         return None
 
     days = [name for i, name in enumerate(_DOW_CRON) if (mask & (1 << i))]
@@ -61,12 +50,7 @@ def mask_to_cron(mask: Optional[int]) -> Optional[str]:
 
 def mask_to_human(mask: Optional[int]) -> str:
     """
-    Возвращает человекочитаемую подпись:
-      - "Daily" — все дни
-      - "Weekdays" — будни
-      - "Weekends" — выходные
-      - "Mon, Wed, Fri" — перечисление конкретных дней
-      - "—" — если mask пустая/0
+    Возвращает человекочитаемую подпись: "Daily", "Weekdays", "Mon, Wed, Fri" и т.д.
     """
     if mask is None:
         return "Daily"
@@ -83,3 +67,47 @@ def mask_to_human(mask: Optional[int]) -> str:
 
     days = [name for i, name in enumerate(_DOW_HUMAN) if (mask & (1 << i))]
     return ", ".join(days) if days else "—"
+
+# (ИЗМЕНЕНО) Добавлен алиас для обратной совместимости
+mask_to_days_label = mask_to_human
+
+def parse_days_to_mask(value: str | None) -> int | None:
+    """
+    Преобразует текстовое описание дней (Daily, Weekdays, Mon,Wed) в битовую маску.
+    """
+    if not value:
+        return None
+    s = value.strip().lower()
+    if not s:
+        return None
+    
+    _SHORT2IDX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+    if s in ("daily",):
+        return all_days_mask()
+    if s in ("weekdays", "wd", "workdays"):
+        return weekdays_mask()
+    if s in ("weekends", "we"):
+        return weekends_mask()
+    
+    items = [x.strip() for x in s.replace(";", ",").split(",") if x.strip()]
+    mask = 0
+    for it in items:
+        idx = _SHORT2IDX.get(it[:3])
+        if idx is None:
+            return None
+        mask |= (1 << idx)
+    return mask or None
+
+
+def _parse_hhmm(s: str) -> Tuple[bool, str | None]:
+    """Проверяет, является ли строка валидным временем HH:MM."""
+    try:
+        hh, mm = s.strip().split(":")
+        hh_i, mm_i = int(hh), int(mm)
+        if 0 <= hh_i <= 23 and 0 <= mm_i <= 59:
+            return True, None
+    except Exception:
+        pass
+    return False, "Time must be HH:MM (00-23:00-59)."
+

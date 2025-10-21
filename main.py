@@ -1,7 +1,7 @@
 # main.py
 # ------------------------------------------------------------
 # Точка входа бота (aiogram v3.7+).
-# Подключаем только корневой роутер, инициализируем БД и планировщик.
+# Подключаем корневой роутер, инициализируем БД и планировщик.
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -16,6 +16,9 @@ from app.config import settings
 from app.routers import router as root_router
 from app.database.init_db import init_db
 from app.services.scheduler import init_schedule
+
+# Middleware для защиты от флуда (НОВОЕ)
+from app.middleware.throttling import ThrottlingMiddleware
 
 # ВАЖНО: привязки бота к сервисам
 from app.services import tg_io
@@ -41,6 +44,10 @@ async def main() -> None:
     # Привязываем bot к утилитам, которым нужен живой инстанс
     tg_io.bind_bot(bot)
     bind_notifications_bot(bot)
+
+    # !!! НОВОЕ: Регистрируем middleware для защиты от флуда
+    # Важно делать это до подключения роутеров
+    dp.update.middleware(ThrottlingMiddleware())
 
     # Подключаем корневой роутер
     dp.include_router(root_router)

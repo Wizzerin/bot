@@ -1,240 +1,278 @@
 # app/routers/tokens.py
-from __future__ import annotations
+# ------------------------------------------------------------
+# Управление токенами и аккаунтами Threads.
+# ------------------------------------------------------------
+
 import logging
 from html import escape
 
 from aiogram import Router, F
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
 from aiogram.filters import Command
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from sqlalchemy import select, func
 
-from app.database.models import async_session, Account, BotSettings
-from app.keyboards import (
-    tokens_menu_kb,
-    accounts_pick_kb,   # оставляем импорт (не ломаем совместимость)
-    accounts_menu_kb,
-    account_actions_kb,
-)
+from sqlalchemy import select, delete, update
+
+from app.database.models import async_session, Account
 from app.services.safe_edit import safe_edit
-from app.services.token_health import check_token_for_user, recheck_user_tokens
-from app.services.threads_client import ThreadsError, get_profile  # для обработки невалидного токена
+from app.services.threads_client import get_profile as get_threads_profile, ThreadsError
+from app.services.token_health import check_and_cache_token_health
+from app.keyboards import accounts_menu_kb, account_actions_kb, account_delete_confirm_kb
 
-router = Router(name="tokens")
 log = logging.getLogger(__name__)
+router = Router()
 
 
+# ---------- FSMs ----------
 class SetTokenFSM(StatesGroup):
     waiting_token = State()
 
-
-@router.message(F.text == "🔑 Token")
-async def token_menu_from_button(message: Message) -> None:
-    await message.answer("Token / Accounts:", reply_markup=tokens_menu_kb())
+class RenameAccountFSM(StatesGroup):
+    waiting_new_name = State()
 
 
-@router.callback_query(F.data == "token_menu")
-async def token_menu_cb(cb: CallbackQuery) -> None:
-    await safe_edit(cb.message, "Token / Accounts:", reply_markup=tokens_menu_kb())
-    await cb.answer()
-
-
-async def _create_new_account_for_user(user_id: int) -> Account:
-    """
-    Создаёт НОВЫЙ аккаунт пользователя (не перетирая существующие).
-    Первый созданный становится дефолтным.
-    ВАЖНО: access_token заполняем пустой строкой (NOT NULL в БД).
-    (ОСТАВЛЕНО для совместимости — но в новом потоке set token мы НЕ создаём черновики.)
-    """
-    async with async_session() as session:
-        count = (await session.execute(
-            select(func.count(Account.id)).where(Account.tg_user_id == user_id)
-        )).scalar() or 0
-        title = f"account {count + 1}"
-
-        acc = Account(tg_user_id=user_id, title=title, access_token="")  # <-- не None!
-        session.add(acc)
-        await session.commit()
-        await session.refresh(acc)
-
-        st = await session.get(BotSettings, user_id)
-        if not st:
-            st = BotSettings(tg_user_id=user_id, default_account_id=acc.id)
-            session.add(st)
-            await session.commit()
-
-        return acc
-
-
-# -------- Set token --------
+# ===============================================
+#   ДОБАВЛЕНИЕ/ИЗМЕНЕНИЕ ТОКЕНА
+# ===============================================
 
 @router.callback_query(F.data == "tok_set")
-async def tok_set(cb: CallbackQuery, state: FSMContext) -> None:
-    """
-    FIX: больше не создаём "черновой" аккаунт заранее.
-    Сначала спрашиваем токен, валидируем его, и только потом пишем в БД.
-    Так мы не получаем пустых/битых аккаунтов.
-    """
-    await state.clear()
+async def tok_enter_token_start(cb: CallbackQuery, state: FSMContext) -> None:
+    await safe_edit(cb.message, "Send me your Threads token (starts with 'TH...').\n/cancel to cancel.")
     await state.set_state(SetTokenFSM.waiting_token)
-    await safe_edit(
-        cb.message,
-        "Send access token (starts with <code>TH</code>)\n\n/cancel to abort",
-    )
     await cb.answer()
 
 
-# ---- CANCEL во время ввода токена (фикс) ----
+@router.message(Command("set_token"))
+async def tok_save_token_cmd(message: Message, state: FSMContext) -> None:
+    if not message.text or len(message.text.split()) < 2:
+        await message.answer("Usage: <code>/set_token TH...</code>")
+        return
 
-@router.message(SetTokenFSM.waiting_token, Command("cancel"))
-@router.message(SetTokenFSM.waiting_token, F.text.lower() == "/cancel")
-async def tok_set_cancel(message: Message, state: FSMContext) -> None:
-    """Корректно прерываем FSM и возвращаемся в меню токенов."""
-    await state.clear()
-    await message.answer("✖️ Canceled.", reply_markup=tokens_menu_kb())
+    token = message.text.split(maxsplit=1)[1]
 
+    # (ИЗМЕНЕНО) Удаляем сообщение пользователя для безопасности
+    await message.delete()
 
-@router.callback_query(F.data.startswith("acc_pick:"))
-async def tok_account_chosen(cb: CallbackQuery, state: FSMContext) -> None:
-    """Если где-то вызывается выбор аккаунта для ввода токена (оставлено для совместимости)."""
-    # В новой логике всё равно ждём токен и создадим новый аккаунт ПОсле валидации.
-    await state.set_state(SetTokenFSM.waiting_token)
-    await safe_edit(
-        cb.message,
-        "Send access token (starts with <code>TH</code>)\n\n/cancel to abort",
-    )
-    await cb.answer()
+    await _process_and_save_token(message, state, token)
 
 
 @router.message(SetTokenFSM.waiting_token)
-async def tok_save_token(message: Message, state: FSMContext) -> None:
-    """
-    Новая логика:
-      1) Получаем строку токена.
-      2) Валидируем её через Threads (check_token_for_user(..., access_token=...)).
-      3) Если валидно — СОЗДАЁМ новый аккаунт с этим токеном и при необходимости выставляем default.
-      4) Если не валидно — ничего не создаём.
-    """
+async def tok_enter_token_msg(message: Message, state: FSMContext) -> None:
     token = (message.text or "").strip()
-    user_id = message.from_user.id
-
-    # мягкая первичная проверка формата
-    if not token or not token.startswith("TH") or len(token) < 10:
-        await message.answer("Looks like a wrong token. Try again or /cancel.")
+    if not token.startswith("TH"):
+        await message.answer("Token should start with 'TH...'. Try again or /cancel.")
         return
 
-    # --- проверяем токен у Threads ---
-    try:
-        prof = await get_profile(token)  # вернёт dict с данными профиля либо кинет ThreadsError
-    except ThreadsError as e:
-        await message.answer("Looks like a wrong token. Try again or /cancel.")
-        return
-    except Exception as e:
-        await message.answer("Temporary error while validating token. Try again a bit later or /cancel.")
-        log.exception("token validate error: %s", e)
-        return
-    title = None
-    if isinstance(prof, dict):
-        title = prof.get("username") or prof.get("id")
-    title = title or "account"
+    # (ИЗМЕНЕНО) Удаляем сообщение пользователя для безопасности
+    await message.delete()
 
-    # --- сохраняем аккаунт только сейчас ---
-    async with async_session() as session:
-        # Считаем порядковый номер для читаемого title, если username не пришёл
-        if title == "account":
-            count = (await session.execute(
-                select(func.count(Account.id)).where(Account.tg_user_id == user_id)
-            )).scalar() or 0
-            title = f"account {count + 1}"
+    await _process_and_save_token(message, state, token)
 
-        acc = Account(tg_user_id=user_id, title=title, access_token=token)
-        session.add(acc)
-        await session.flush()  # получить acc.id
 
-        # если дефолтный ещё не выставлен — выставим на этот
-        st = await session.get(BotSettings, user_id)
-        if not st:
-            st = BotSettings(tg_user_id=user_id, default_account_id=acc.id)
-            session.add(st)
-        elif not st.default_account_id:
-            st.default_account_id = acc.id
-
-        await session.commit()
-
+async def _process_and_save_token(message: Message, state: FSMContext, token: str) -> None:
+    """Общая логика проверки и сохранения токена."""
     await state.clear()
-    await message.answer(
-        f"✅ Token saved for <b>{escape(title)}</b>.",
-        reply_markup=tokens_menu_kb(),
-    )
+    wait_msg = await message.answer("Checking token...")
+    
+    try:
+        profile = await get_threads_profile(token)
+        username = profile.get("username", "unknown")
+        
+        async with async_session() as session:
+            new_acc = Account(
+                tg_user_id=message.from_user.id,
+                access_token=token,
+                title=username,
+            )
+            session.add(new_acc)
+            await session.commit()
+            
+            await check_and_cache_token_health(new_acc.id, notify_on_error=False)
+
+            # Устанавливаем как "по-умолчанию", если это первый аккаунт
+            q = select(Account).where(Account.tg_user_id == message.from_user.id)
+            user_accounts = (await session.execute(q)).scalars().all()
+            if len(user_accounts) == 1:
+                user_accounts[0].is_default = True
+                await session.commit()
+
+        await wait_msg.edit_text(f"✅ Token is valid and saved!\nAccount: <b>{username}</b>")
+
+    except ThreadsError as e:
+        await wait_msg.edit_text(f"❌ Invalid token: {e}")
+    except Exception as e:
+        log.exception("Error setting token: %s", e)
+        await wait_msg.edit_text("❌ An unexpected error occurred.")
 
 
-# -------- Check / Recheck --------
+# ===============================================
+#   УПРАВЛЕНИЕ АККАУНТАМИ
+# ===============================================
 
-@router.callback_query(F.data == "tok_check")
-async def tok_check(entry) -> None:
-    msg = entry.message if hasattr(entry, "message") else entry
-    user_id = msg.chat.id
-    status, info = await check_token_for_user(user_id)
-    if status == "ok":
-        await msg.answer("✅ Token is valid.", reply_markup=tokens_menu_kb())
-    else:
-        await msg.answer(f"❌ Token error: {info or 'unknown'}", reply_markup=tokens_menu_kb())
-    if hasattr(entry, "answer"):
-        await entry.answer()
-
-
-@router.callback_query(F.data == "tok_recheck_all")
-async def tok_recheck_all(entry) -> None:
-    msg = entry.message if hasattr(entry, "message") else entry
-    user_id = msg.chat.id
-    summary = await recheck_user_tokens(user_id)
-    lines = [f"Checked: {summary.get('total', 0)} — ok: {summary.get('ok', 0)}, error: {summary.get('error', 0)}"]
-    for acc_id, title, status, err in summary.get("details", []):
-        line = f"• {title} (id={acc_id}): {status}"
-        if err and status != "ok":
-            line += f" — {err}"
-        lines.append(line)
-    await msg.answer("\n".join(lines), reply_markup=tokens_menu_kb())
-    if hasattr(entry, "answer"):
-        await entry.answer()
-
-
-# -------- Accounts (просмотр) --------
-
-@router.callback_query(F.data == "accounts_menu")
-async def tok_accounts_menu(cb: CallbackQuery) -> None:
-    await safe_edit(cb.message, "Accounts:", reply_markup=accounts_menu_kb())
-    await cb.answer()
-
-
-@router.callback_query(F.data == "accounts_list")
-async def tok_accounts_list(cb: CallbackQuery) -> None:
-    """
-    Показываем список аккаунтов с подсветкой ⭐ default.
-    (Не меняем имя функции; строим клавиатуру здесь, чтобы видеть звёздочку.)
-    """
+@router.callback_query(F.data == "tok_accounts")
+async def acc_list_menu(cb: CallbackQuery) -> None:
     user_id = cb.from_user.id
     async with async_session() as session:
-        accs = (await session.execute(
+        accounts = (await session.execute(
             select(Account).where(Account.tg_user_id == user_id).order_by(Account.id)
         )).scalars().all()
-        st = await session.get(BotSettings, user_id)
 
-    if not accs:
-        await safe_edit(cb.message, "No accounts yet. Press <b>Set token</b> to add one.",
-                        reply_markup=tokens_menu_kb())
-        await cb.answer()
+    if not accounts:
+        await safe_edit(
+            cb.message,
+            "You have no accounts yet. Press '🔑 Set token' to add one.",
+            reply_markup=accounts_menu_kb([]) # Показываем только кнопку "Set" и "Back"
+        )
+        await cb.answer(); return
+
+    await safe_edit(cb.message, "Select an account to manage:", reply_markup=accounts_menu_kb(accounts))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("acc_view:"))
+async def acc_view_actions(cb: CallbackQuery) -> None:
+    user_id = cb.from_user.id
+    try:
+        acc_id = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Invalid account ID.", show_alert=True); return
+
+    async with async_session() as session:
+        acc = await session.get(Account, acc_id)
+
+    if not acc or acc.tg_user_id != user_id:
+        await cb.answer("Account not found.", show_alert=True); return
+
+    wait_msg = await cb.message.answer("Checking token health...")
+    is_healthy, reason = await check_and_cache_token_health(acc_id, notify_on_error=False)
+    await wait_msg.delete()
+    
+    status_icon = "✅" if is_healthy else "❌"
+    status_text = "Healthy" if is_healthy else f"Invalid ({reason})"
+    
+    default_text = " (default)" if acc.is_default else ""
+
+    text = (
+        f"<b>Account:</b> {escape(acc.title or 'N/A')}{default_text}\n"
+        f"<b>Status:</b> {status_icon} {status_text}"
+    )
+    
+    await safe_edit(cb.message, text, reply_markup=account_actions_kb(acc_id))
+    await cb.answer()
+
+
+# ---- Удаление аккаунта ----
+@router.callback_query(F.data.startswith("acc_delete:"))
+async def acc_delete_confirm(cb: CallbackQuery):
+    try:
+        acc_id = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Invalid account ID.", show_alert=True); return
+
+    await safe_edit(
+        cb.message,
+        "Are you sure you want to delete this account and all its scheduled posts?",
+        reply_markup=account_delete_confirm_kb(acc_id)
+    )
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("acc_delete_confirm:"))
+async def acc_delete_do(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    try:
+        acc_id_to_delete = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Invalid account ID.", show_alert=True); return
+
+    async with async_session() as session:
+        # 1. Удаляем аккаунт
+        await session.execute(
+            delete(Account)
+            .where(Account.id == acc_id_to_delete, Account.tg_user_id == user_id)
+        )
+        
+        # 2. Проверяем, не был ли удаленный аккаунт единственным или дефолтным
+        remaining_accounts = (await session.execute(
+            select(Account).where(Account.tg_user_id == user_id).order_by(Account.id)
+        )).scalars().all()
+        
+        # 3. Если остались аккаунты, но среди них нет дефолтного, назначаем новый
+        if remaining_accounts and not any(acc.is_default for acc in remaining_accounts):
+            remaining_accounts[0].is_default = True
+        
+        await session.commit()
+
+    await cb.answer("Account deleted.")
+    await acc_list_menu(cb) # Возвращаемся к списку аккаунтов
+
+
+# ---- Переименование ----
+@router.callback_query(F.data.startswith("acc_rename:"))
+async def acc_rename_start(cb: CallbackQuery, state: FSMContext):
+    try:
+        acc_id = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Invalid account ID.", show_alert=True); return
+    
+    await state.set_state(RenameAccountFSM.waiting_new_name)
+    await state.update_data(rename_acc_id=acc_id)
+    await safe_edit(cb.message, "Send a new name for this account (e.g., 'Work Account').\n/cancel to abort.")
+    await cb.answer()
+
+@router.message(RenameAccountFSM.waiting_new_name)
+async def acc_rename_finish(message: Message, state: FSMContext):
+    new_name = (message.text or "").strip()
+    if not new_name or len(new_name) > 50:
+        await message.answer("Name cannot be empty or longer than 50 characters. Try again or /cancel.")
         return
 
-    default_id = st.default_account_id if st else None
-    rows = []
-    for a in accs:
-        title = a.title or f"account {a.id}"
-        star = "⭐ " if default_id and a.id == default_id else ""
-        rows.append([InlineKeyboardButton(text=f"{star}{title}", callback_data=f"acc_setdef:{a.id}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="token_menu")])
-    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    data = await state.get_data()
+    acc_id = data.get("rename_acc_id")
 
-    await safe_edit(cb.message, "Choose an account:", reply_markup=kb)
-    await cb.answer()
+    async with async_session() as session:
+        await session.execute(
+            update(Account)
+            .where(Account.id == acc_id, Account.tg_user_id == message.from_user.id)
+            .values(title=new_name)
+        )
+        await session.commit()
+    
+    await state.clear()
+    await message.answer("✅ Account renamed.")
+    
+    # "Фальшивый" callback, чтобы вернуться к просмотру аккаунта
+    fake_cb = type("C", (), {"data": f"acc_view:{acc_id}", "message": message, "from_user": message.from_user, "answer": lambda: None})
+    await acc_view_actions(fake_cb)
+
+
+# ---- Установка по-умолчанию ----
+@router.callback_query(F.data.startswith("acc_set_default:"))
+async def acc_set_default(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    try:
+        acc_id_to_set = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Invalid account ID.", show_alert=True); return
+
+    async with async_session() as session:
+        # Сначала снимаем флаг со всех аккаунтов пользователя
+        await session.execute(
+            update(Account)
+            .where(Account.tg_user_id == user_id)
+            .values(is_default=False)
+        )
+        # Затем устанавливаем флаг на выбранный
+        await session.execute(
+            update(Account)
+            .where(Account.id == acc_id_to_set, Account.tg_user_id == user_id)
+            .values(is_default=True)
+        )
+        await session.commit()
+
+    await cb.answer("Set as default account.")
+    
+    # "Фальшивый" callback, чтобы обновить отображение
+    fake_cb = type("C", (), {"data": f"acc_view:{acc_id_to_set}", "message": cb.message, "from_user": cb.from_user, "answer": lambda: None})
+    await acc_view_actions(fake_cb)
+

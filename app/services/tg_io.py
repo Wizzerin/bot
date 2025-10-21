@@ -1,23 +1,20 @@
 # app/services/tg_io.py
 # ------------------------------------------------------------
-# Привязка Bot и выдача публичных URL для медиа.
-# build_public_url(file_id):
-#   1) скачивает файл из Telegram
-#   2) пытается залить на Telegraph (несколько доменов)
-#   3) если не вышло — заливает на catbox.moe (анонимно)
-#
-# Совместимые алиасы сохранены:
-#   file_public_url / get_public_url / get_file_public_url
+# (ИЗМЕНЕНО) Привязка Bot и выдача публичных URL для медиа.
+# Основной хостинг теперь - imgbb.com, остальные - резервные.
 # ------------------------------------------------------------
 
 from __future__ import annotations
 
 import os
+import base64
 import mimetypes
 from typing import Optional, Tuple
 
 from aiogram import Bot
 import httpx
+
+from app.config import settings # Для доступа к IMGBB_API_KEY
 
 _bot: Optional[Bot] = None
 
@@ -36,7 +33,7 @@ async def _download_tg_file_bytes(file_id: str) -> Tuple[bytes, str, str]:
         raise RuntimeError("tg_io: bot is not bound")
 
     tg_file = await _bot.get_file(file_id)
-    file_path = tg_file.file_path  # например photos/file_10.jpg
+    file_path = tg_file.file_path
     filename = os.path.basename(file_path) or "file"
     url = f"https://api.telegram.org/file/bot{_bot.token}/{file_path}"
 
@@ -47,24 +44,44 @@ async def _download_tg_file_bytes(file_id: str) -> Tuple[bytes, str, str]:
 
     ct, _ = mimetypes.guess_type(filename)
     if not ct:
-        # попытаемся угадать по сигнатурам позже при необходимости
         ct = "application/octet-stream"
     return data, filename, ct
 
 
+async def _upload_to_imgbb(data: bytes, filename: str) -> str:
+    """(НОВЫЙ) Загружает байты на imgbb.com и возвращает URL."""
+    api_key = settings.IMGBB_API_KEY
+    if not api_key:
+        raise RuntimeError("IMGBB_API_KEY is not configured in .env")
+
+    b64_image = base64.b64encode(data).decode("ascii")
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://api.imgbb.com/1/upload",
+            data={"key": api_key, "name": filename, "image": b64_image},
+        )
+        resp.raise_for_status()
+        j = resp.json()
+
+        if not j.get("success"):
+            err = j.get("error", {})
+            raise RuntimeError(f"imgbb upload failed: {err or j}")
+
+        url = (j.get("data") or {}).get("url")
+        if not url:
+            raise RuntimeError(f"imgbb: no url in response: {j}")
+        return url
+
+
 async def _upload_to_telegraph_like(host: str, data: bytes, filename: str, content_type: str) -> str:
-    """
-    Грузим файл на один из Telegraph-хостов:
-      host in {"https://telegra.ph", "https://te.legra.ph", "https://graph.org"}
-    Возвращаем публичный https-URL.
-    """
+    """Грузим файл на один из Telegraph-хостов (резервный метод)."""
     url = f"{host}/upload"
     files = {"file": (filename, data, content_type)}
     async with httpx.AsyncClient(timeout=60.0) as cli:
         r = await cli.post(url, files=files)
         r.raise_for_status()
         js = r.json()
-        # формат ответа: [{"src": "/file/xxxxxxxxx.jpg"}]
         if not isinstance(js, list) or not js or "src" not in js[0]:
             raise RuntimeError(f"telegraph upload unexpected response: {js!r}")
         src = js[0]["src"]
@@ -74,13 +91,7 @@ async def _upload_to_telegraph_like(host: str, data: bytes, filename: str, conte
 
 
 async def _upload_to_catbox(data: bytes, filename: str, content_type: str) -> str:
-    """
-    Fallback-хостинг: catbox.moe (анонимно).
-    Возвращает публичный URL в виде простого текста.
-    API: POST https://catbox.moe/user/api.php
-      data: { reqtype: 'fileupload' }
-      files: { fileToUpload: <file> }
-    """
+    """Резервный хостинг: catbox.moe."""
     api = "https://catbox.moe/user/api.php"
     form = {"reqtype": "fileupload"}
     files = {"fileToUpload": (filename, data, content_type)}
@@ -95,31 +106,37 @@ async def _upload_to_catbox(data: bytes, filename: str, content_type: str) -> st
 
 async def build_public_url(file_id: str) -> str:
     """
-    Возвращает ПУБЛИЧНЫЙ URL для файла Telegram, годный для Threads API.
+    (ИЗМЕНЕНО) Возвращает ПУБЛИЧНЫЙ URL для файла Telegram.
     Порядок:
-      1) telegra.ph
-      2) te.legra.ph
-      3) graph.org
-      4) catbox.moe (fallback, принимает большие файлы)
+      1) imgbb.com (основной)
+      2) telegra.ph (резервный)
+      3) te.legra.ph (резервный)
+      4) graph.org (резервный)
+      5) catbox.moe (последний резервный)
     """
     data, filename, ct = await _download_tg_file_bytes(file_id)
-
-    # Пробуем Telegraph-провайдеров по очереди
     errors = []
 
+    # 1. Пробуем imgbb
+    if settings.IMGBB_API_KEY:
+        try:
+            return await _upload_to_imgbb(data, filename)
+        except Exception as e:
+            errors.append(f"imgbb.com: {e}")
+
+    # 2. Пробуем Telegraph-провайдеров
     for host in ("https://telegra.ph", "https://te.legra.ph", "https://graph.org"):
         try:
             return await _upload_to_telegraph_like(host, data, filename, ct)
         except Exception as e:
             errors.append(f"{host}: {e}")
 
-    # Fallback на catbox.moe (подходит под ограничения Threads: публичный CDN-URL)
+    # 3. Последний резервный вариант - catbox.moe
     try:
         return await _upload_to_catbox(data, filename, ct)
     except Exception as e:
         errors.append(f"catbox.moe: {e}")
 
-    # Если все варианты упали — бросаем подробную ошибку (логи наверху поймают)
     raise RuntimeError("All re-host attempts failed: " + " | ".join(errors))
 
 
@@ -128,10 +145,8 @@ async def build_public_url(file_id: str) -> str:
 async def file_public_url(file_id: str) -> str:
     return await build_public_url(file_id)
 
-
 async def get_public_url(file_id: str) -> str:
     return await build_public_url(file_id)
-
 
 async def get_file_public_url(file_id: str) -> str:
     return await build_public_url(file_id)

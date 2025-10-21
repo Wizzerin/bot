@@ -8,41 +8,11 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-@dataclass(frozen=True)
-class Settings:
-    TG_BOT_TOKEN: str
-    DATABASE_URL: str = "sqlite+aiosqlite:///db.sqlite3"
-
-    APP_ID: Optional[str] = None
-    APP_SECRET: Optional[str] = None
-
-    TOKEN_HEALTH_INTERVAL_HOURS: int = 24
-    TOKEN_HEALTH_NOTIFY: bool = True
-
-    # НОВОЕ: для обратной совместимости со старым кодом
-    THREADS_TOKEN: Optional[str] = None   # ← ИЗМЕНЕНИЕ
-
-    @staticmethod
-    def from_env() -> "Settings":
-        tg_token = os.getenv("TG_BOT_TOKEN", "").strip()
-        if not tg_token:
-            raise RuntimeError("TG_BOT_TOKEN is not set. Add it to environment or .env file.")
-
-        return Settings(
-            TG_BOT_TOKEN=tg_token,
-            DATABASE_URL=os.getenv("DATABASE_URL", "sqlite+aiosqlite:///db.sqlite3"),
-            APP_ID=os.getenv("APP_ID") or None,
-            APP_SECRET=os.getenv("APP_SECRET") or None,
-            TOKEN_HEALTH_INTERVAL_HOURS=_getenv_int("TOKEN_HEALTH_INTERVAL_HOURS", 24),
-            TOKEN_HEALTH_NOTIFY=_getenv_bool("TOKEN_HEALTH_NOTIFY", True),
-            THREADS_TOKEN=os.getenv("THREADS_TOKEN") or None,  # ← ИЗМЕНЕНИЕ
-        )
-
 # Пытаемся загрузить .env, если есть python-dotenv; если нет — просто игнорируем.
 try:
-    from dotenv import load_dotenv  # type: ignore
+    from dotenv import load_dotenv
     load_dotenv(override=False)
-except Exception:
+except ImportError:
     pass
 
 
@@ -65,17 +35,23 @@ def _getenv_int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class Settings:
-    # --- обязательные / основные ---
+    # --- Обязательные / основные ---
     TG_BOT_TOKEN: str
     DATABASE_URL: str = "sqlite+aiosqlite:///db.sqlite3"
 
-    # --- Threads API (если используешь) ---
+    # --- Threads API ---
     APP_ID: Optional[str] = None
     APP_SECRET: Optional[str] = None
+    
+    # (ИЗМЕНЕНО) Добавлен ключ для imgbb
+    IMGBB_API_KEY: Optional[str] = None
 
-    # --- здоровье токенов ---
+    # --- Здоровье токенов ---
     TOKEN_HEALTH_INTERVAL_HOURS: int = 24  # период автопроверки
     TOKEN_HEALTH_NOTIFY: bool = True       # уведомлять при ошибке
+
+    # --- Для обратной совместимости ---
+    THREADS_TOKEN: Optional[str] = None
 
     @staticmethod
     def from_env() -> "Settings":
@@ -84,14 +60,16 @@ class Settings:
             raise RuntimeError(
                 "TG_BOT_TOKEN is not set. Add it to environment or .env file."
             )
-        IMGBB_API_KEY: str | None = None
+        
         return Settings(
             TG_BOT_TOKEN=tg_token,
             DATABASE_URL=os.getenv("DATABASE_URL", "sqlite+aiosqlite:///db.sqlite3"),
             APP_ID=os.getenv("APP_ID") or None,
             APP_SECRET=os.getenv("APP_SECRET") or None,
+            IMGBB_API_KEY=os.getenv("IMGBB_API_KEY") or None, # (ИЗМЕНЕНО) Загружаем ключ
             TOKEN_HEALTH_INTERVAL_HOURS=_getenv_int("TOKEN_HEALTH_INTERVAL_HOURS", 24),
-            TOKEN_HEALTH_NOTIFY=_getenv_bool("TOKEN_HEALTH_NOTIFY", True),           
+            TOKEN_HEALTH_NOTIFY=_getenv_bool("TOKEN_HEALTH_NOTIFY", True),
+            THREADS_TOKEN=os.getenv("THREADS_TOKEN") or None,
         )
 
 

@@ -98,6 +98,8 @@ async def _run_job(job_id: int) -> None:
     text, marker_url = _split_text_and_image_url(orig_text)
 
     image_urls: list[str] = []
+    # НОВОЕ: Флаг для отслеживания ошибок обработки изображений
+    image_processing_failed = False
 
     if marker_url:
         # 2a) Если есть маркер — он имеет приоритет, игнорируем связанные media,
@@ -114,6 +116,8 @@ async def _run_job(job_id: int) -> None:
             except Exception as e:
                 logger.warning("media url build failed job_id=%s media_id=%s: %s",
                                job_id, getattr(m, "id", "?"), e)
+                # НОВОЕ: Устанавливаем флаг при ошибке
+                image_processing_failed = True
 
     # 3) Публикация
     try:
@@ -134,13 +138,29 @@ async def _run_job(job_id: int) -> None:
 
         preview = f"{text[:100]}{'…' if len(text) > 100 else ''}"
         nowz = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        
+        # --- ИЗМЕНЕНИЕ: Формируем уведомление с возможным предупреждением ---
+        # Формируем базовое сообщение
+        success_message_lines = [
+            f"⏰ {time_str} — published",
+            f"🧾 {preview}",
+            f"🖼️ images: {len(image_urls)}",
+        ]
+
+        # Добавляем предупреждение, если картинки не обработались,
+        # но текст успешно опубликован (и картинок в итоге нет)
+        if image_processing_failed and not image_urls and media_items:
+            success_message_lines.insert(2, "⚠️ (Image failed to process)")
+
+        success_message_lines.append(f"🕒 {nowz}")
+        
+        # Отправляем уведомление
         await notify_user(
             job.tg_user_id,
-            f"⏰ {time_str} — published\n"
-            f"🧾 {preview}\n"
-            f"🖼️ images: {len(image_urls)}\n"
-            f"🕒 {nowz}"
+            "\n".join(success_message_lines)
         )
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
         logger.info("_run_job: posted job_id=%s user=%s time=%s images=%s",
                     job_id, job.tg_user_id, time_str, len(image_urls))
 

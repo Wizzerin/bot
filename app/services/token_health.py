@@ -16,15 +16,20 @@ from app.config import settings
 
 log = logging.getLogger(__name__)
 
-async def _check_and_cache_account(acc: Account, notify_on_error: bool = True) -> Tuple[str, Optional[str]]:
-    """Пингует Threads `/me` для аккаунта, обновляет кеш статуса в БД.
-    Возвращает (status, message) где status in {"ok", "error"}.
+async def check_and_cache_token_health(acc_id: int, notify_on_error: bool = True) -> Tuple[bool, Optional[str]]:
     """
+    Проверяет токен для конкретного аккаунта по ID, обновляет кеш статуса в БД.
+    Возвращает (is_healthy: bool, message: str | None).
+    """
+    async with async_session() as session:
+        acc = await session.get(Account, acc_id)
+        if not acc:
+            return False, "Account not found"
+
     status = "ok"
     msg = None
     try:
-        me = await get_profile(acc.access_token)  # используем get_profile из threads_client
-        # если захотим — можем обновить title из username
+        me = await get_profile(acc.access_token)
         if not acc.title and isinstance(me, dict):
             uname = me.get("username")
             if uname:
@@ -33,6 +38,7 @@ async def _check_and_cache_account(acc: Account, notify_on_error: bool = True) -
         status, msg = "error", str(e)[:200]
     except Exception as e:
         status, msg = "error", "Unexpected error"
+        log.warning("Token check for acc %s failed with unexpected error: %s", acc.id, e)
 
     # кешируем
     try:
@@ -42,7 +48,6 @@ async def _check_and_cache_account(acc: Account, notify_on_error: bool = True) -
                 db_acc.token_status = status
                 db_acc.token_status_msg = msg
                 db_acc.token_checked_at = datetime.now(timezone.utc)
-                # не трогаем access_token; title — по желанию
                 if acc.title and not db_acc.title:
                     db_acc.title = acc.title
             await session.commit()
@@ -61,7 +66,7 @@ async def _check_and_cache_account(acc: Account, notify_on_error: bool = True) -
         except Exception as e:
             log.warning("token_health: notify failed for acc %s: %s", acc.id, e)
 
-    return status, msg
+    return status == "ok", msg
 
 async def periodic_token_health() -> int:
     """Периодически вызывается планировщиком: проверяет токены у всех пользователей,
@@ -79,7 +84,6 @@ async def periodic_token_health() -> int:
         accs = (await session.execute(select(Account))).scalars().all()
 
     for acc in accs:
-        # если никогда не проверяли — проверим
         need = False
         if not getattr(acc, "token_checked_at", None):
             need = True
@@ -90,7 +94,8 @@ async def periodic_token_health() -> int:
                 need = True
 
         if need:
-            await _check_and_cache_account(acc, notify_on_error=True)
+            # Используем новую функцию, которая принимает ID
+            await check_and_cache_token_health(acc.id, notify_on_error=True)
             total += 1
             await asyncio.sleep(0.15)
 
@@ -105,10 +110,12 @@ async def check_token_for_user(tg_user_id: int) -> Tuple[str, Optional[str]]:
 
     if not acc:
         return "error", "no accounts"
+    
+    is_healthy, msg = await check_and_cache_token_health(acc.id, notify_on_error=False)
+    return "ok" if is_healthy else "error", msg
 
-    return await _check_and_cache_account(acc, notify_on_error=False)
 
-async def check_all_tokens_for_user(tg_user_id: int):
+async def recheck_user_tokens(tg_user_id: int):
     """Проверяет все аккаунты пользователя, но без уведомлений в чат. Возвращает summary."""
     async with async_session() as session:
         accs = (await session.execute(
@@ -117,11 +124,9 @@ async def check_all_tokens_for_user(tg_user_id: int):
 
     summary = {"total": len(accs), "ok": 0, "error": 0, "details": []}
     for a in accs:
-        status, msg = await _check_and_cache_account(a, notify_on_error=False)
-        summary["ok" if status == "ok" else "error"] += 1
+        is_healthy, msg = await check_and_cache_token_health(a.id, notify_on_error=False)
+        status = "ok" if is_healthy else "error"
+        summary[status] += 1
         summary["details"].append((a.id, a.title or "untitled", status, msg))
         await asyncio.sleep(0.15)
     return summary
-
-async def recheck_user_tokens(tg_user_id: int):
-    return await check_all_tokens_for_user(tg_user_id)
