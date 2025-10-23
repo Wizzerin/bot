@@ -1,20 +1,7 @@
 # app/routers/post_now.py
 # ------------------------------------------------------------
 # 📝 Post now
-# Поток:
-#   1) /start → кнопка "📝 Post now" или callback "post_now"
-#   2) Просим текст → "Send the post text (or /cancel)"
-#   3) Разрешаем докинуть до 10 фото (обычные photo-сообщения)
-#      показываем превью-счётчик и кнопки:
-#        • ✅ Publish    — публикует
-#        • ♻️ Clear      — очищает выбранные фото
-#        • ↩️ Cancel     — отмена
-#   4) Публикуем через publish_auto(text, access_token, image_urls)
-#      image_urls строим через get_file_public_url(file_id)
-# Особенности:
-#   • Если фото не приложены/не удалось собрать URL — уйдёт чисто текст.
-#   • Если аккаунтов >1, пытаемся взять BotSettings.default_account_id,
-#     иначе — просим выбрать из списка.
+# (ИЗМЕНЕНИЕ) Теперь сохраняет опубликованные посты в архив.
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -35,7 +22,8 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select
 
-from app.database.models import async_session, Account, BotSettings
+# (ИЗМЕНЕНИЕ) Импортируем новую модель PublishedPost
+from app.database.models import async_session, Account, BotSettings, PublishedPost
 from app.services.safe_edit import safe_edit
 from app.services.tg_io import get_file_public_url
 from app.services.threads_client import publish_auto, ThreadsError
@@ -47,9 +35,9 @@ router = Router()
 # ---------------------- FSM ---------------------- #
 
 class PostNowFSM(StatesGroup):
-    choosing_account = State()   # если у пользователя >1 аккаунта
-    waiting_text     = State()   # ждём текст поста
-    waiting_media    = State()   # собираем фото и ждём Publish
+    choosing_account = State()
+    waiting_text     = State()
+    waiting_media    = State()
 
 
 # -------------------- ВХОД ----------------------- #
@@ -217,16 +205,16 @@ async def post_now_cancel(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(PostNowFSM.waiting_media, F.data == "post_publish")
 async def post_now_publish(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    
     user_id = cb.from_user.id
     payload = await state.get_data()
     text: str = payload.get("text", "") or ""
     account_id: Optional[int] = payload.get("account_id")
     file_ids: List[str] = payload.get("images", []) or []
 
-    # 1) Проверим аккаунт
     async with async_session() as session:
         if not account_id:
-            # fallback: взять дефолтный или первый
             st = await session.get(BotSettings, user_id)
             if st and st.default_account_id:
                 account_id = st.default_account_id
@@ -238,42 +226,50 @@ async def post_now_publish(cb: CallbackQuery, state: FSMContext):
 
         if not account_id:
             await safe_edit(cb.message, "No account selected. Add a token first.")
-            await cb.answer()
             await state.clear()
             return
 
         acc = await session.get(Account, account_id)
         if not acc or not acc.access_token:
             await safe_edit(cb.message, "Account has no token. Set token and try again.")
-            await cb.answer()
             await state.clear()
             return
 
-    # 2) Преобразуем file_id → публичные URL (могут не получиться — тогда публикуем текст)
-    image_urls: List[str] = []
-    for fid in file_ids:
-        try:
-            url = await get_file_public_url(fid)
-            if url:
-                image_urls.append(url)
-        except Exception as e:
-            log.warning("post_now: failed to build public url for %s: %s", fid, e)
+        image_urls: List[str] = []
+        for fid in file_ids:
+            try:
+                url = await get_file_public_url(fid)
+                if url:
+                    image_urls.append(url)
+            except Exception as e:
+                log.warning("post_now: failed to build public url for %s: %s", fid, e)
 
-    # 3) Публикация — только через publish_auto (никогда не уходит кривой media_type)
-    try:
-        post_id = await publish_auto(text=text, access_token=acc.access_token, image_urls=image_urls)
-        await safe_edit(
-            cb.message,
-            "✅ Published\n"
-            f"🧾 {escape(text[:100])}{'…' if len(text) > 100 else ''}\n"
-            f"🖼️ images: {len(image_urls)}\n"
-            f"🆔 {escape(str(post_id))}"
-        )
-        await state.clear()
-    except ThreadsError as e:
-        await safe_edit(cb.message, f"❌ Publish error: {escape(str(e))}")
-    except Exception as e:
-        log.exception("post_now: unexpected error: %s", e)
-        await safe_edit(cb.message, f"❌ Unexpected error: {escape(str(e))}")
-    finally:
-        await cb.answer()
+        try:
+            result = await publish_auto(text=text, access_token=acc.access_token, image_urls=image_urls)
+            
+            # (ИЗМЕНЕНИЕ) Сохранение в архив
+            post_id = result.get("id") or (result.get("published") or {}).get("id")
+            if post_id:
+                archive_entry = PublishedPost(
+                    threads_post_id=str(post_id),
+                    tg_user_id=user_id,
+                    account_id=account_id,
+                    text=text
+                )
+                session.add(archive_entry)
+                await session.commit()
+            
+            await safe_edit(
+                cb.message,
+                "✅ Published\n"
+                f"🧾 {escape(text[:100])}{'…' if len(text) > 100 else ''}\n"
+                f"🖼️ images: {len(image_urls)}\n"
+                f"🆔 {escape(str(post_id))}"
+            )
+            await state.clear()
+        except ThreadsError as e:
+            await safe_edit(cb.message, f"❌ Publish error: {escape(str(e))}")
+        except Exception as e:
+            log.exception("post_now: unexpected error: %s", e)
+            await safe_edit(cb.message, f"❌ Unexpected error: {escape(str(e))}")
+

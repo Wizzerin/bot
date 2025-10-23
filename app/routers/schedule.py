@@ -309,8 +309,13 @@ async def sched_list(cb: CallbackQuery) -> None:
     """Вместо текста, выводит задачи в виде кнопок."""
     user_id = cb.from_user.id
     async with async_session() as session:
+        # (ИЗМЕНЕНИЕ) Используем selectinload для "жадной" загрузки связанных медиа-файлов,
+        # чтобы избежать дополнительных запросов к БД в цикле.
         jobs = (await session.execute(
-            select(Job).where(Job.tg_user_id == user_id).order_by(Job.time_str, Job.id)
+            select(Job)
+            .where(Job.tg_user_id == user_id)
+            .options(selectinload(Job.media)) # <-- Вот это изменение
+            .order_by(Job.time_str, Job.id)
         )).scalars().all()
 
     if not jobs:
@@ -713,4 +718,3 @@ async def import_schedule_receive_doc(message: Message, state: FSMContext) -> No
         f"📥 Imported {added} row(s), skipped {errors}. Active timers: {active}",
         reply_markup=schedule_menu()
     )
-

@@ -14,7 +14,7 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
 
 from app.database.models import async_session, BotSettings
-from app.keyboards import tz_menu_kb, notify_menu
+from app.keyboards import notify_menu
 from app.services.safe_edit import safe_edit
 from app.services.scheduler import reload_schedule
 

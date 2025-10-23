@@ -1,92 +1,121 @@
 # app/routers/nav.py
 # ------------------------------------------------------------
-# Главное меню и основная навигация.
+# (ИЗМЕНЕНИЕ) Исправлена ошибка ValidationError для ReplyKeyboardMarkup.
+# (ИЗМЕНЕНИЕ) Исправлено использование safe_edit.
+# Роутер для базовой навигации: /start, /menu, Settings.
 # ------------------------------------------------------------
 
-from __future__ import annotations
+from typing import Union # <-- Импортировано
+import logging
 
-from aiogram import Router, F
+from aiogram import Router, F, types
 from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    Union,
-)
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton # Добавлен KeyboardButton
+from aiogram.fsm.context import FSMContext
 
+from app.keyboards import main_menu_kb, settings_menu_kb # Инлайн-клавиатуры
+# Импорты для обработки кнопок Drafts и Archive
+from .drafts import drafts_list_menu
+from .archive import archive_list_dates
+# (ИСПРАВЛЕНИЕ) Импортируем safe_edit напрямую
 from app.services.safe_edit import safe_edit
 
+
+log = logging.getLogger(__name__)
 router = Router()
 
+# (ИЗМЕНЕНО) Лог для проверки загрузки роутера
+log.info("Navigation router loaded!")
 
-# --- Клавиатуры ---
-
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    """Основная Reply-клавиатура (кнопки внизу)."""
-    rows = [
-        [KeyboardButton(text="📝 Post now"), KeyboardButton(text="⏱ Schedule")],
-        [KeyboardButton(text="🔑 Accounts"), KeyboardButton(text="⚙️ Settings")],
-    ]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-
-
-def inline_main_kb() -> InlineKeyboardMarkup:
-    """Основное инлайн-меню."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Post now", callback_data="post_now")],
-        [InlineKeyboardButton(text="⏱ Schedule", callback_data="sched_menu")],
-        [InlineKeyboardButton(text="🔑 Accounts", callback_data="token_menu")],
-        [InlineKeyboardButton(text="⚙️ Settings", callback_data="settings_menu")],
-    ])
-
-def settings_menu_kb() -> InlineKeyboardMarkup:
-    """Инлайн-меню настроек."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔔 Notifications", callback_data="notify_menu")],
-        [InlineKeyboardButton(text="ℹ️ Help", callback_data="help_show")],
-        [InlineKeyboardButton(text="⬅️ Back", callback_data="back_main")],
-    ])
+# --- Нижняя (Reply) клавиатура ---
+# Определяем макет кнопок
+main_reply_kb_layout = [
+    ["📝 Post now", "⏱ Schedule"],
+    ["📄 Drafts", "🔑 Accounts"],
+    ["⚙️ Settings"]
+]
 
 
-# --- Обработчики ---
-
+# --- Обработчики команд ---
 @router.message(CommandStart())
-async def start_cmd(message: Message) -> None:
+async def cmd_start(message: Message, state: FSMContext):
     """Обработчик команды /start."""
+    await state.clear()
+    # (ИСПРАВЛЕНИЕ) Создаем кнопки здесь
+    keyboard_buttons = [
+        [KeyboardButton(text=text) for text in row]
+        for row in main_reply_kb_layout
+    ]
+    kb = types.ReplyKeyboardMarkup(keyboard=keyboard_buttons, resize_keyboard=True)
     await message.answer(
-        "Hi! This is a bot for posting to Threads.\n"
-        "Use the buttons below to navigate.",
-        reply_markup=main_menu_kb(),
+        "Welcome! 👋\nI can help you schedule posts or post directly to Threads.",
+        reply_markup=kb,
     )
-
+    # Сразу покажем инлайн-меню тоже
+    await message.answer("Choose an action:", reply_markup=main_menu_kb())
 
 @router.message(Command("menu"))
-@router.message(F.text.in_(["Menu", "menu", "Меню", "меню", "🏠 Menu"]))
-async def menu_cmd(message: Message) -> None:
-    """
-    Обработчик команды /menu и текстовых сообщений для вызова меню.
-    Показывает основное инлайн-меню.
-    """
-    await message.answer("Main menu:", reply_markup=inline_main_kb())
+async def cmd_menu(message: Message, state: FSMContext):
+    """Обработчик команды /menu."""
+    await state.clear()
+    await message.answer("Main menu:", reply_markup=main_menu_kb())
 
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    """Обработчик команды /cancel (глобальный)."""
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("No active action to cancel.", reply_markup=main_menu_kb())
+        return
 
+    log.info("Cancelling state %r for user %d", current_state, message.from_user.id)
+    await state.clear()
+    await message.answer("Action cancelled.", reply_markup=main_menu_kb())
+
+# --- Обработчики CallbackQuery ---
 @router.callback_query(F.data == "back_main")
-async def back_main_cb(cb: CallbackQuery):
-    """Возврат в главное инлайн-меню."""
-    await safe_edit(cb.message, "Main menu:", reply_markup=inline_main_kb())
+async def back_to_main_menu(cb: CallbackQuery, state: FSMContext):
+    """Возврат в главное меню из других разделов."""
+    await state.clear()
+    # (ИСПРАВЛЕНИЕ) Используем safe_edit напрямую
+    await safe_edit(cb.message, "Main menu:", reply_markup=main_menu_kb())
     await cb.answer()
 
-
-@router.message(F.text == "⚙️ Settings")
 @router.callback_query(F.data == "settings_menu")
-async def settings_menu_cb(event: Union[Message, CallbackQuery]):
-    """Отображает меню настроек."""
-    text = "Settings:"
-    markup = settings_menu_kb()
-    if isinstance(event, Message):
-        await event.answer(text, reply_markup=markup)
+async def show_settings_menu(cb: CallbackQuery, state: FSMContext):
+    """Показывает меню настроек."""
+    await state.clear() # Сбрасываем состояние при входе в настройки
+    # (ИСПРАВЛЕНИЕ) Используем safe_edit напрямую
+    await safe_edit(cb.message, "Settings:", reply_markup=settings_menu_kb())
+    await cb.answer()
+
+# --- Обработчики текстовых кнопок ReplyKeyboard (если нужны) ---
+@router.message(F.text == "⚙️ Settings")
+async def handle_settings_button(message: Message, state: FSMContext):
+    """Обрабатывает нажатие текстовой кнопки 'Settings'."""
+    await state.clear()
+    await message.answer("Settings:", reply_markup=settings_menu_kb()) # Отправляем инлайн-меню
+
+# --- (НОВОЕ) Обработчики для Drafts и Archive ---
+@router.message(F.text == "📄 Drafts")
+@router.callback_query(F.data == "drafts_menu")
+async def handle_drafts_button(evt: Union[CallbackQuery, Message], state: FSMContext):
+    """Обрабатывает кнопку Drafts (текстовую и инлайн)."""
+    await drafts_list_menu(evt, state) # Вызываем функцию из drafts.py
+
+@router.message(F.text == "🗄️ Archive") # При нажатии на reply кнопку
+@router.callback_query(F.data == "archive_list:0") # При нажатии на inline кнопку в settings
+async def handle_archive_button(evt: Union[CallbackQuery, Message], state: FSMContext):
+    """Обрабатывает кнопку Archive (текстовую и инлайн)."""
+    # Создаем фейковый CallbackQuery, если пришло сообщение
+    if isinstance(evt, Message):
+        async def mock_answer(*args, **kwargs): pass
+        # (ИСПРАВЛЕНИЕ) Используем правильный класс CallbackQuery
+        cb = types.CallbackQuery(id='fake_archive', from_user=evt.from_user, message=evt, chat_instance='fake_archive', data="archive_list:0")
+        # Добавляем мок-метод answer после создания объекта
+        cb.answer = mock_answer
     else:
-        await safe_edit(event.message, text, reply_markup=markup)
-        await event.answer()
+        cb = evt
+
+    await archive_list_dates(cb, state) # Вызываем функцию из archive.py
+

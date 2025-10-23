@@ -39,6 +39,36 @@ class RenameAccountFSM(StatesGroup):
 #   ГЛАВНОЕ МЕНЮ РАЗДЕЛА
 # ===============================================
 
+# --- НОВЫЙ ХЕНДЛЕР ---
+# Этот хендлер перехватывает нажатие на reply-кнопку "🔑 Accounts"
+# и имитирует нажатие inline-кнопки "tok_accounts",
+# чтобы повторно использовать существующую логику acc_list_menu.
+@router.message(F.text == "🔑 Accounts")
+async def handle_accounts_text_button(message: Message):
+    """
+    Перехватывает нажатие на reply-кнопку "🔑 Accounts"
+    и имитирует нажатие inline-кнопки "tok_accounts",
+    чтобы повторно использовать существующую логику acc_list_menu.
+    """
+    
+    async def mock_answer(*args, **kwargs):
+        # Эта функция-пустышка нужна,
+        # т.к. acc_list_menu вызывает cb.answer()
+        pass
+
+    # Создаем "фейковый" объект CallbackQuery,
+    # чтобы передать его в acc_list_menu
+    fake_cb = type("FakeCallbackQuery", (object,), {
+        "data": "tok_accounts",
+        "message": message, # Используем сообщение от кнопки
+        "from_user": message.from_user,
+        "answer": mock_answer # Передаем async-пустышку
+    })
+    
+    await acc_list_menu(fake_cb)
+# --- КОНЕЦ НОВОГО ХЕНДЛЕРА ---
+
+
 @router.callback_query(F.data == "tok_accounts")
 async def acc_list_menu(cb: CallbackQuery) -> None:
     """Отображает список аккаунтов или меню для их добавления."""
@@ -49,6 +79,7 @@ async def acc_list_menu(cb: CallbackQuery) -> None:
         )).scalars().all()
 
     if not accounts:
+        # Если сообщение можно отредактировать, делаем это. Иначе отправляем новое.
         await safe_edit(
             cb.message,
             "You have no accounts yet. Press '🔑 Set token' to add one.",
@@ -239,8 +270,16 @@ async def acc_rename_finish(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ Account renamed.")
     
-    fake_cb = type("C", (), {"data": f"acc_view:{acc_id}", "message": message, "from_user": message.from_user, "answer": lambda: None})
-    await acc_view_actions(fake_cb)
+    async def mock_answer(*args, **kwargs): pass
+
+    fake_cb = type("FakeCallbackQuery", (object,), {
+        "data": f"acc_view:{acc_id}",
+        "message": message, 
+        "from_user": message.from_user,
+        "answer": mock_answer
+    })
+    
+    await acc_list_menu(fake_cb)
 
 
 # ---- Установка по-умолчанию ----
@@ -253,11 +292,13 @@ async def acc_set_default(cb: CallbackQuery):
         await cb.answer("Invalid account ID.", show_alert=True); return
 
     async with async_session() as session:
+        # Сначала снимаем флаг "default" со всех аккаунтов
         await session.execute(
             update(Account)
             .where(Account.tg_user_id == user_id)
             .values(is_default=False)
         )
+        # Затем ставим "default" нужному
         await session.execute(
             update(Account)
             .where(Account.id == acc_id_to_set, Account.tg_user_id == user_id)
@@ -267,6 +308,5 @@ async def acc_set_default(cb: CallbackQuery):
 
     await cb.answer("Set as default account.")
     
-    fake_cb = type("C", (), {"data": f"acc_view:{acc_id_to_set}", "message": cb.message, "from_user": cb.from_user, "answer": lambda: None})
-    await acc_view_actions(fake_cb)
-
+    # Обновляем текущее меню, чтобы показать "(default)"
+    await acc_view_actions(cb)

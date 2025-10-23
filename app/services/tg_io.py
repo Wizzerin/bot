@@ -1,7 +1,6 @@
 # app/services/tg_io.py
 # ------------------------------------------------------------
-# (ИЗМЕНЕНО) Привязка Bot и выдача публичных URL для медиа.
-# Основной хостинг теперь - imgbb.com, остальные - резервные.
+# (ИЗМЕНЕНИЕ) Убрана загрузка на imgbb.com, возвращен приоритет Telegraph-хостам.
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from typing import Optional, Tuple
 from aiogram import Bot
 import httpx
 
-from app.config import settings # Для доступа к IMGBB_API_KEY
+from app.config import settings # Все еще может понадобиться для других настроек в будущем
 
 _bot: Optional[Bot] = None
 
@@ -48,34 +47,13 @@ async def _download_tg_file_bytes(file_id: str) -> Tuple[bytes, str, str]:
     return data, filename, ct
 
 
-async def _upload_to_imgbb(data: bytes, filename: str) -> str:
-    """(НОВЫЙ) Загружает байты на imgbb.com и возвращает URL."""
-    api_key = settings.IMGBB_API_KEY
-    if not api_key:
-        raise RuntimeError("IMGBB_API_KEY is not configured in .env")
-
-    b64_image = base64.b64encode(data).decode("ascii")
-    
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.imgbb.com/1/upload",
-            data={"key": api_key, "name": filename, "image": b64_image},
-        )
-        resp.raise_for_status()
-        j = resp.json()
-
-        if not j.get("success"):
-            err = j.get("error", {})
-            raise RuntimeError(f"imgbb upload failed: {err or j}")
-
-        url = (j.get("data") or {}).get("url")
-        if not url:
-            raise RuntimeError(f"imgbb: no url in response: {j}")
-        return url
+# --- Функция _upload_to_imgbb удалена или закомментирована, так как Meta ее не принимает ---
+# async def _upload_to_imgbb(data: bytes, filename: str) -> str:
+#     ... (код функции)
 
 
 async def _upload_to_telegraph_like(host: str, data: bytes, filename: str, content_type: str) -> str:
-    """Грузим файл на один из Telegraph-хостов (резервный метод)."""
+    """Грузим файл на один из Telegraph-хостов (теперь основной метод)."""
     url = f"{host}/upload"
     files = {"file": (filename, data, content_type)}
     async with httpx.AsyncClient(timeout=60.0) as cli:
@@ -108,30 +86,29 @@ async def build_public_url(file_id: str) -> str:
     """
     (ИЗМЕНЕНО) Возвращает ПУБЛИЧНЫЙ URL для файла Telegram.
     Порядок:
-      1) imgbb.com (основной)
-      2) telegra.ph (резервный)
-      3) te.legra.ph (резервный)
-      4) graph.org (резервный)
-      5) catbox.moe (последний резервный)
+      1) telegra.ph (основной)
+      2) te.legra.ph (резервный)
+      3) graph.org (резервный)
+      4) catbox.moe (последний резервный)
     """
     data, filename, ct = await _download_tg_file_bytes(file_id)
     errors = []
 
-    # 1. Пробуем imgbb
-    if settings.IMGBB_API_KEY:
-        try:
-            return await _upload_to_imgbb(data, filename)
-        except Exception as e:
-            errors.append(f"imgbb.com: {e}")
+    # --- (ИЗМЕНЕНИЕ) Попытка загрузки на imgbb удалена ---
+    # if settings.IMGBB_API_KEY:
+    #     try:
+    #         return await _upload_to_imgbb(data, filename)
+    #     except Exception as e:
+    #         errors.append(f"imgbb.com: {e}")
 
-    # 2. Пробуем Telegraph-провайдеров
+    # 1. Пробуем Telegraph-провайдеров (теперь это основной способ)
     for host in ("https://telegra.ph", "https://te.legra.ph", "https://graph.org"):
         try:
             return await _upload_to_telegraph_like(host, data, filename, ct)
         except Exception as e:
             errors.append(f"{host}: {e}")
 
-    # 3. Последний резервный вариант - catbox.moe
+    # 2. Последний резервный вариант - catbox.moe
     try:
         return await _upload_to_catbox(data, filename, ct)
     except Exception as e:

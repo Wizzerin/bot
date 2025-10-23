@@ -1,14 +1,6 @@
 # app/services/scheduler.py
 # ------------------------------------------------------------
-# Планировщик публикаций:
-#  • init_scheduler(bot)  — запуск APS + периодическая проверка токенов
-#  • reload_schedule()    — пересборка Cron-задач из таблицы Job
-#  • _run_job(job_id)     — публикация поста (текст + медиа) и уведомление
-# Учитывает:
-#  • личную TZ пользователя (BotSettings.tz, иначе Europe/Berlin)
-#  • маску дней недели dow_mask через mask_to_crон()
-#  • eager-load media (selectinload) — без MissingGreenlet/DetachedInstanceError
-#  • безопасная публикация через publish_auto(...)
+# (ИЗМЕНЕНИЕ) Теперь сохраняет опубликованные посты в архив.
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -27,7 +19,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.database.models import async_session, Job, Account, BotSettings
+# (ИЗМЕНЕНИЕ) Импортируем новую модель PublishedPost
+from app.database.models import async_session, Job, Account, BotSettings, PublishedPost
 from app.services.notifications import notify_user, bind_bot
 from app.services.schedule_utils import mask_to_cron
 from app.services.token_health import periodic_token_health
@@ -39,7 +32,6 @@ _scheduler: Optional[AsyncIOScheduler] = None
 
 DEFAULT_TZ = "Europe/Berlin"
 
-# поддержка маркера картинок в тексте
 IMG_MARK_RE = re.compile(r"\n\s*\[IMG\]\s+(?P<url>\S+)\s*$", re.IGNORECASE)
 
 
@@ -72,7 +64,6 @@ def _split_text_and_image_url(text: str) -> tuple[str, Optional[str]]:
 async def _run_job(job_id: int) -> None:
     logger.debug("_run_job: start job_id=%s", job_id)
 
-    # 1) Читаем Job с медиа и Account в одной сессии
     async with async_session() as session:
         res = await session.execute(
             select(Job)
@@ -94,82 +85,67 @@ async def _run_job(job_id: int) -> None:
         time_str = job.time_str
         media_items = list(job.media or [])
 
-    # 2) СНАЧАЛА разбираем маркер и ВСЕГДА чистим текст
-    text, marker_url = _split_text_and_image_url(orig_text)
+        text, marker_url = _split_text_and_image_url(orig_text)
+        image_urls: list[str] = []
+        image_processing_failed = False
 
-    image_urls: list[str] = []
-    # НОВОЕ: Флаг для отслеживания ошибок обработки изображений
-    image_processing_failed = False
+        if marker_url:
+            image_urls = [marker_url]
+        else:
+            for m in media_items:
+                try:
+                    if getattr(m, "source", "telegram") == "telegram" and getattr(m, "tg_file_id", None):
+                        url = await get_file_public_url(m.tg_file_id)
+                        if url:
+                            image_urls.append(url)
+                except Exception as e:
+                    logger.warning("media url build failed job_id=%s media_id=%s: %s",
+                                   job_id, getattr(m, "id", "?"), e)
+                    image_processing_failed = True
 
-    if marker_url:
-        # 2a) Если есть маркер — он имеет приоритет, игнорируем связанные media,
-        # чтобы не подтянулась “старая”/не та картинка
-        image_urls = [marker_url]
-    else:
-        # 2b) Маркера нет — используем связанные media из БД
-        for m in media_items:
-            try:
-                if getattr(m, "source", "telegram") == "telegram" and getattr(m, "tg_file_id", None):
-                    url = await get_file_public_url(m.tg_file_id)
-                    if url:
-                        image_urls.append(url)
-            except Exception as e:
-                logger.warning("media url build failed job_id=%s media_id=%s: %s",
-                               job_id, getattr(m, "id", "?"), e)
-                # НОВОЕ: Устанавливаем флаг при ошибке
-                image_processing_failed = True
-
-    # 3) Публикация
-    try:
-        logger.debug("publish decision: images=%d marker=%s", len(image_urls), bool(marker_url))
-        if image_urls:
-            await publish_auto(
+        try:
+            result = await publish_auto(
                 acc.access_token,
                 text=text,
-                media_type="IMAGE",
                 image_urls=image_urls,
             )
-        else:
-            await publish_auto(
-                acc.access_token,
-                text=text,
-                media_type="TEXT",
-            )
+            
+            # (ИЗМЕНЕНИЕ) Сохранение в архив
+            post_id = result.get("id") or (result.get("published") or {}).get("id")
+            if post_id:
+                archive_entry = PublishedPost(
+                    threads_post_id=str(post_id),
+                    tg_user_id=job.tg_user_id,
+                    account_id=job.account_id,
+                    text=text,
+                    has_media=bool(image_urls or marker_url) # <-- Сохраняем информацию о медиа
+                )
+                session.add(archive_entry)
+                await session.commit()
+            
+            preview = f"{text[:100]}{'…' if len(text) > 100 else ''}"
+            nowz = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            
+            success_message_lines = [
+                f"⏰ {time_str} — published",
+                f"🧾 {preview}",
+                f"🖼️ images: {len(image_urls)}",
+            ]
+            if image_processing_failed and not image_urls and media_items:
+                success_message_lines.insert(2, "⚠️ (Image failed to process)")
+            success_message_lines.append(f"🕒 {nowz}")
+            
+            await notify_user(job.tg_user_id, "\n".join(success_message_lines))
 
-        preview = f"{text[:100]}{'…' if len(text) > 100 else ''}"
-        nowz = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-        
-        # --- ИЗМЕНЕНИЕ: Формируем уведомление с возможным предупреждением ---
-        # Формируем базовое сообщение
-        success_message_lines = [
-            f"⏰ {time_str} — published",
-            f"🧾 {preview}",
-            f"🖼️ images: {len(image_urls)}",
-        ]
+            logger.info("_run_job: posted job_id=%s user=%s time=%s images=%s",
+                        job_id, job.tg_user_id, time_str, len(image_urls))
 
-        # Добавляем предупреждение, если картинки не обработались,
-        # но текст успешно опубликован (и картинок в итоге нет)
-        if image_processing_failed and not image_urls and media_items:
-            success_message_lines.insert(2, "⚠️ (Image failed to process)")
-
-        success_message_lines.append(f"🕒 {nowz}")
-        
-        # Отправляем уведомление
-        await notify_user(
-            job.tg_user_id,
-            "\n".join(success_message_lines)
-        )
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
-
-        logger.info("_run_job: posted job_id=%s user=%s time=%s images=%s",
-                    job_id, job.tg_user_id, time_str, len(image_urls))
-
-    except ThreadsError as e:
-        await notify_user(job.tg_user_id, f"❌ Publish error at {time_str}: {e}")
-        logger.warning("_run_job: ThreadsError job_id=%s user=%s: %s", job_id, job.tg_user_id, e)
-    except Exception as e:
-        await notify_user(job.tg_user_id, f"❌ Unexpected error at {time_str}: {e}")
-        logger.exception("_run_job: unexpected error job_id=%s user=%s: %s", job_id, job.tg_user_id, e)
+        except ThreadsError as e:
+            await notify_user(job.tg_user_id, f"❌ Publish error at {time_str}: {e}")
+            logger.warning("_run_job: ThreadsError job_id=%s user=%s: %s", job_id, job.tg_user_id, e)
+        except Exception as e:
+            await notify_user(job.tg_user_id, f"❌ Unexpected error at {time_str}: {e}")
+            logger.exception("_run_job: unexpected error job_id=%s user=%s: %s", job_id, job.tg_user_id, e)
 
 
 # ----------------------- ЖИЗНЕННЫЙ ЦИКЛ -------------------- #
@@ -273,3 +249,4 @@ async def reload_schedule() -> int:
 # Backward-compat
 async def init_schedule(bot, tz: str = DEFAULT_TZ):
     return await init_scheduler(bot, tz)
+
